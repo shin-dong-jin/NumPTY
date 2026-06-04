@@ -1,0 +1,152 @@
+---
+- name: Install Node 24 + PM2 + build tools + setup_os dependencies for bff
+  hosts: bff
+  become: yes
+
+  vars:
+    api_user: numpty
+    api_group: numpty
+    bff_home: /opt/numpty/bff
+    node_major: "24"
+
+  tasks:
+    # ===== Node.js 24 LTS 설치 (NodeSource 저장소) =====
+    # AL2023 기본 dnf의 node는 옛 버전이라 NodeSource 저장소 추가.
+    # 결과: /usr/bin/node, /usr/bin/npm — 시스템 전역, dnf 관리.
+    # nvm·fnm 같은 사용자별 도구 안 씀 — systemd가 numpty(nologin) 사용자로
+    # 실행하니 시스템 경로가 필수.
+    - name: Check if Node is already installed at correct version
+      ansible.builtin.command:
+        cmd: node --version
+      register: node_check
+      failed_when: false
+      changed_when: false
+
+    - name: Setup NodeSource repository for Node {{ node_major }}
+      ansible.builtin.shell:
+        cmd: "curl -fsSL https://rpm.nodesource.com/setup_{{ node_major }}.x | bash -"
+      when: node_check.rc != 0 or not node_check.stdout.startswith('v' + node_major)
+
+    - name: Install Node.js {{ node_major }}
+      ansible.builtin.dnf:
+        name: nodejs
+        state: present
+
+    # ===== PM2 글로벌 설치 =====
+    # npm으로 PM2 깔면 /usr/lib/node_modules/pm2에 들어가고,
+    # /usr/bin/pm2와 /usr/bin/pm2-runtime 심볼릭이 자동 생성됨.
+    # systemd unit에서 /usr/bin/pm2-runtime 호출.
+    - name: Check if PM2 is installed
+      ansible.builtin.stat:
+        path: /usr/bin/pm2-runtime
+      register: pm2_check
+
+    - name: Install PM2 globally via npm
+      ansible.builtin.npm:
+        name: pm2
+        global: yes
+        state: present
+      when: not pm2_check.stat.exists
+
+    # ===== C 컴파일 도구 + 네이티브 npm 패키지 빌드 의존성 =====
+    # gcc, make: C wrapper 컴파일용 (setup_os.sh가 호출)
+    # node-pty 같은 네이티브 npm 패키지도 EC2에서 빌드되니 같은 도구 필요.
+    # python3: 일부 네이티브 패키지(node-gyp 기반)가 요구.
+    # worker가 깐 거랑 같은 도구지만 bff EC2엔 따로 깔아야 함 (다른 인스턴스).
+    - name: Install build toolchain (gcc, make, python3)
+      ansible.builtin.dnf:
+        name:
+          - gcc
+          - gcc-c++
+          - make
+          - python3
+        state: present
+
+    # ===== setup_os.sh가 참조하는 명령들 =====
+    # clear, date, ls, uname, uptime은 AL2023 기본 설치.
+    # curl도 AL2023 기본. jq는 별도.
+    - name: Install jq for setup_os.sh
+      ansible.builtin.dnf:
+        name: jq
+        state: present
+
+    # ===== zsh (본인 pty가 /bin/zsh 호출) =====
+    # appProperties.js의 pty.file이 /bin/zsh라 — zsh 설치 필수.
+    # 안 깔면 node-pty가 zsh 못 찾아서 터미널 안 뜸.
+    - name: Install zsh (bff pty uses /bin/zsh)
+      ansible.builtin.dnf:
+        name: zsh
+        state: present
+
+    # ===== starship (셸 프롬프트) =====
+    # AL2023 dnf 기본 저장소에 없을 가능성 높아 공식 install script 사용.
+    # 멱등성: 이미 설치돼 있으면 install script가 알아서 skip 또는 갱신.
+    # /usr/local/bin/starship에 설치됨 (script 기본 경로).
+    - name: Check if starship is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/starship
+      register: starship_check
+
+    - name: Install starship via official script
+      ansible.builtin.shell:
+        cmd: "curl -sS https://starship.rs/install.sh | sh -s -- --yes"
+      when: not starship_check.stat.exists
+
+    # ===== numpty 사용자 + 그룹 =====
+    # api/worker와 같은 사용자. system user, nologin.
+    - name: Create numpty service group
+      ansible.builtin.group:
+        name: "{{ api_group }}"
+        state: present
+        system: yes
+
+    - name: Create numpty service user
+      ansible.builtin.user:
+        name: "{{ api_user }}"
+        group: "{{ api_group }}"
+        home: /opt/numpty
+        shell: /sbin/nologin
+        system: yes
+        state: present
+
+    # ===== bff home 디렉터리 =====
+    - name: Create bff home directory
+      ansible.builtin.file:
+        path: "{{ bff_home }}"
+        owner: "{{ api_user }}"
+        group: "{{ api_group }}"
+        mode: "0755"
+        state: directory
+
+    # ===== 설치 확인 =====
+    - name: Verify node version
+      ansible.builtin.command:
+        cmd: node --version
+      register: node_version
+      changed_when: false
+
+    - name: Verify pm2-runtime exists
+      ansible.builtin.command:
+        cmd: pm2-runtime --version
+      register: pm2_version
+      changed_when: false
+
+    - name: Verify zsh exists
+      ansible.builtin.command:
+        cmd: which zsh
+      register: zsh_path
+      changed_when: false
+
+    - name: Verify starship exists
+      ansible.builtin.command:
+        cmd: starship --version
+      register: starship_version
+      changed_when: false
+
+    - name: Show installed versions
+      ansible.builtin.debug:
+        msg:
+          - "Node: {{ node_version.stdout }}"
+          - "PM2: {{ pm2_version.stdout }}"
+          - "zsh: {{ zsh_path.stdout }}"
+          - "starship: {{ starship_version.stdout_lines[0] }}"

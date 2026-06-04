@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NumPTY - Bastion stack (ephemeral jump host).
+  A small t3.micro EC2 in the PUBLIC subnet used ONLY as an SSH jump host
+  (ProxyJump) to reach the PRIVATE data/app instances.
+  Designed to be created right before a deploy and DELETED right after,
+  so the SSH entry point does not sit exposed 24/7.
+
+  Key design points:
+  - SG has NO inbound rule by default. The workflow adds the runner's
+    public IP (/32) to port 22 at deploy time, then removes it (and the
+    whole stack) afterwards. So 22 is closed unless a deploy is running.
+  - This host stores NO private keys. With ProxyJump, the bastion only
+    relays the encrypted tunnel; authentication to the final host happens
+    end-to-end with the key held by the runner/local. If the bastion is
+    compromised, no data/app key is exposed here.
+  - Imports VpcId / PublicSubnetId from the network stack.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: numpty
+    Description: Prefix for naming and ImportValue lookups.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Bastion is just a relay; t3.micro is plenty.
+
+  BastionKeyName:
+    Type: String
+    Default: numpty-bastion-key
+    Description: Existing EC2 key pair name used to SSH into the bastion.
+
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Always-latest Amazon Linux 2023 AMI from the AWS public SSM path.
+
+Resources:
+  # ---------- Bastion Security Group ----------
+  # Intentionally has NO SecurityGroupIngress here. Port 22 is opened
+  # dynamically by the workflow for the runner's single /32 IP, then
+  # revoked. Egress is open so the bastion can relay outbound SSH to the
+  # private subnet (and do its own package updates if ever needed).
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} bastion SG (ingress added at deploy time only)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (relay SSH into private subnet)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-bastion-sg"
+
+  # ---------- Bastion host ----------
+  # No UserData: this box installs nothing and stores nothing.
+  # It exists purely to be an SSH ProxyJump relay. Keeping it empty is the
+  # point - a compromised bastion yields no secrets.
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref BastionKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PublicSubnetId"
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-bastion"
+        - Key: Role
+          Value: bastion
+
+Outputs:
+  BastionInstanceId:
+    Description: Bastion EC2 instance ID
+    Value: !Ref BastionInstance
+
+  BastionPublicIp:
+    Description: >
+      Bastion public IP. The workflow SSHes here first, then ProxyJumps
+      to the private data/app hosts. Changes every time the stack is
+      recreated (no EIP - it is ephemeral by design).
+    Value: !GetAtt BastionInstance.PublicIp
+
+  BastionSecurityGroupId:
+    Description: >
+      Bastion SG ID. The workflow uses this to authorize/revoke the
+      runner's IP on port 22 at deploy time.
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-BastionSecurityGroupId"

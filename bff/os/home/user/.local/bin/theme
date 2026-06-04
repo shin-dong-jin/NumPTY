@@ -1,0 +1,16 @@
+#!/bin/zsh
+
+local theme=$1
+local -a valid_themes=(retro amber modern)
+
+if [[ -z $theme ]]; then
+  printf "\x1b[1;31mUsage: theme [${(j:|:)valid_themes}]\r\n\x1b[0m"
+  return 1
+fi
+
+if (( ! ${valid_themes[(Ie)$theme]} )); then
+  printf "\x1b[1;31m'$theme' is unknown theme. (valid: ${(j:, :)valid_themes})\r\n\x1b[0m"
+  return 1
+fi
+
+printf "\x1b]9999;{\"type\":\"theme\",\"theme\":\"$theme\"}\x07"

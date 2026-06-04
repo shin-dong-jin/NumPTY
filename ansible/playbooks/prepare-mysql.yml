@@ -1,0 +1,29 @@
+---
+- name: Prepare persistent EBS data volume for MySQL
+  hosts: mysql
+  become: yes
+
+  vars:
+    mysql_data_device: /dev/nvme1n1 # CFN은 /dev/sdf 로 붙이지만 Nitro(t3)에선 nvme1n1 로 보임
+    mysql_data_mount: /var/lib/mysql # MySQL 기본 datadir
+
+  tasks:
+    - name: Create filesystem (xfs; 이미 포맷돼 있으면 건너뜀 -> retained 데이터 보존)
+      community.general.filesystem:
+        fstype: xfs
+        dev: "{{ mysql_data_device }}"
+        force: no
+
+    - name: Ensure mount point exists
+      ansible.builtin.file:
+        path: "{{ mysql_data_mount }}"
+        state: directory
+        mode: "0755"
+
+    - name: Mount + /etc/fstab 등록
+      ansible.posix.mount:
+        path: "{{ mysql_data_mount }}"
+        src: "{{ mysql_data_device }}"
+        fstype: xfs
+        opts: defaults,nofail
+        state: mounted

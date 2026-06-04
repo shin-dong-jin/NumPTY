@@ -1,0 +1,409 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NumPTY - App tier stack (Layer 3 of 3: network / data / app).
+  Four EC2: webserver (public), api / bff / worker (private).
+  Current flow: user -> web (nginx, 80) -> bff (3000, WebSocket).
+                bff command JS -> api (8080) directly (no /api/* proxy yet).
+                worker has no HTTP inbound; redis stream pub/sub only.
+  Future: nginx /api/* reverse proxy to api -> would unify ingress through web.
+  SSH (22) is NOT defined here. It is added by the deploy-app workflow
+  at deploy time from the ephemeral bastion SG, then revoked. The runtime
+  app-to-app ingress (80, 3000, 8080) stays in the template because these
+  are permanent paths the live system relies on.
+  Software install + webserver config + jar deploy is Ansible's job.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: numpty
+    Description: Prefix for naming and ImportValue lookups.
+
+  ApiInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: api runs Java/Tomcat, needs ~2GB for JVM heap + OS.
+
+  WebInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: webserver is light (reverse proxy + static files); t3.micro is plenty.
+
+  BffInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: bff runs node-pty + daemon; pty sessions can use memory.
+
+  WorkerInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: C worker is light; t3.micro suffices for verification.
+
+  AppKeyName:
+    Type: String
+    Default: numpty-app-key
+    Description: Existing EC2 key pair for the bastion->app SSH hop.
+
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Always-latest Amazon Linux 2023 AMI from the AWS public SSM path.
+
+  DomainName:
+    Type: String
+    Default: numpty.kr
+    Description: Apex domain pointing at the webserver EIP. The Route 53 hosted
+      zone for this domain must already exist (we create it once in the console,
+      not via CFN, so the NS delegation is stable across stack lifecycles).
+
+  HostedZoneName:
+    Type: String
+    Default: numpty.kr.
+    Description: >
+      Hosted zone name with trailing dot (FQDN form). Route 53 requires this
+      exact format - omitting the dot causes RecordSet creation to fail with
+      "HostedZone not found".
+
+Resources:
+  # ---------- Security Groups ----------
+  # SSH (22) for ALL of these SGs is added by the deploy-app workflow at
+  # deploy time (from the ephemeral bastion SG) and revoked after. Only
+  # the runtime app-to-app paths (80, 3000, 8080) live here permanently.
+
+  # webserver: public-facing entry point.
+  # 80 from internet (Let's Encrypt HTTP-01 challenge + redirect to HTTPS).
+  # 443 from internet (real user traffic, TLS terminated here on nginx).
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} webserver SG (80+443: permanent; 22: dynamic via workflow)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP - acme-challenge + redirect to HTTPS
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS - user traffic, TLS terminated on nginx
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-web-sg"
+
+  # bff: 3000 from webserver (nginx -> bff /ws WebSocket proxy).
+  BffSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} bff SG (3000: permanent; 22: dynamic via workflow)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: bff port (WebSocket) - ONLY from webserver
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (api + redis + package install)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-bff-sg"
+
+  # api: 8080 from bff SG (bff command JS fetch -> api).
+  # Note: in the current architecture, nginx does NOT proxy /api/* yet,
+  # so api ingress comes from bff (where the command JS runs), not from
+  # the webserver. If /api/* proxy is added later, this becomes from web SG.
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} api SG (8080: permanent; 22: dynamic via workflow)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref BffSecurityGroup
+          Description: api port - ONLY from bff (bff command JS direct fetch)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (db tier + package install via NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-api-sg"
+
+  # worker: no permanent HTTP inbound. Talks via redis streams only.
+  # 22 is added dynamically by the workflow.
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} worker SG (no permanent inbound; 22: dynamic via workflow)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (redis + package install via NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-worker-sg"
+
+  # ---------- Data tier ingress from app (cross-stack additions) ----------
+  # Each db has its own SG (mysql/mongo/redis split). Each ingress
+  # targets the precise db SG and the precise app SG that needs access.
+  # Result: true least privilege - each db opens only its own port from
+  # only the precisely allowed app tier.
+
+  # api: needs mysql + mongo + redis (full data access).
+  MysqlIngressFromApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::ImportValue: !Sub "${ProjectName}-MysqlSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref ApiSecurityGroup
+      Description: MySQL - from api SG
+
+  MongoIngressFromApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::ImportValue: !Sub "${ProjectName}-MongoSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 27017
+      ToPort: 27017
+      SourceSecurityGroupId: !Ref ApiSecurityGroup
+      Description: MongoDB - from api SG
+
+  RedisIngressFromApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::ImportValue: !Sub "${ProjectName}-RedisSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref ApiSecurityGroup
+      Description: Redis - from api SG (stream publish)
+
+  # bff: needs redis only (daemon subscribes streams).
+  RedisIngressFromBff:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::ImportValue: !Sub "${ProjectName}-RedisSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref BffSecurityGroup
+      Description: Redis - from bff SG (daemon stream subscribe)
+
+  # worker: needs redis only (stream pub/sub).
+  RedisIngressFromWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::ImportValue: !Sub "${ProjectName}-RedisSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref WorkerSecurityGroup
+      Description: Redis - from worker SG (stream pub/sub)
+
+  # ---------- EC2 instances ----------
+  WebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref WebInstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref AppKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PublicSubnetId"
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-web"
+        - Key: Role
+          Value: web
+
+  ApiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref ApiInstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref AppKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnetId"
+      SecurityGroupIds:
+        - !Ref ApiSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-api"
+        - Key: Role
+          Value: api
+
+  BffInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref BffInstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref AppKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnetId"
+      SecurityGroupIds:
+        - !Ref BffSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-bff"
+        - Key: Role
+          Value: bff
+
+  WorkerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref WorkerInstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref AppKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnetId"
+      SecurityGroupIds:
+        - !Ref WorkerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-worker"
+        - Key: Role
+          Value: worker
+
+  # ---------- Elastic IP (webserver only) ----------
+  # webserver is the long-lived user-facing entry; its public IP must survive
+  # instance replacement so DNS/clients keep working. Others are private.
+  # Retain policies guard against accidental loss: deleting or replacing
+  # this stack will NOT release the EIP. Once a domain's A record points
+  # at this address, that address must outlive the stack itself. To
+  # actually release the EIP (e.g. retiring the project), temporarily
+  # change these to Delete or release it manually via the AWS console.
+  WebEip:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref WebInstance
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-web-eip"
+
+  # ---------- DNS records (Route 53) ----------
+  # Hosted zone itself is NOT managed here - it lives in the console so the
+  # NS delegation set is stable. CFN only owns the A/CNAME records inside
+  # the zone. If the stack is deleted, these records vanish with it; that
+  # is fine because the EIP (Retain) and hosted zone (untouched) both
+  # survive, so re-deploying restores everything.
+
+  # Apex domain (numpty.kr) -> web EIP. A record because apex cannot be a
+  # CNAME (RFC 1912). TTL 300s = quick switch on EIP change, low DNS cost.
+  WebApexRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref HostedZoneName
+      Name: !Sub "${DomainName}."
+      Type: A
+      TTL: 300
+      ResourceRecords:
+        - !Ref WebEip
+
+  # www subdomain -> apex (CNAME). Single source of truth: changing the
+  # EIP only requires updating WebApexRecord, www follows automatically.
+  WebWwwRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref HostedZoneName
+      Name: !Sub "www.${DomainName}."
+      Type: CNAME
+      TTL: 300
+      ResourceRecords:
+        - !Ref DomainName
+
+Outputs:
+  WebPublicIp:
+    Description: webserver EIP (user entry point)
+    Value: !Ref WebEip
+    Export:
+      Name: !Sub "${ProjectName}-WebPublicIp"
+
+  WebPrivateIp:
+    Description: webserver private IP
+    Value: !GetAtt WebInstance.PrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-WebPrivateIp"
+
+  ApiPrivateIp:
+    Description: api private IP (bff target + Ansible target)
+    Value: !GetAtt ApiInstance.PrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-ApiPrivateIp"
+
+  BffPrivateIp:
+    Description: bff private IP (webserver upstream for WebSocket)
+    Value: !GetAtt BffInstance.PrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-BffPrivateIp"
+
+  WorkerPrivateIp:
+    Description: worker private IP (Ansible target)
+    Value: !GetAtt WorkerInstance.PrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-WorkerPrivateIp"
+
+  WebInstanceId:
+    Description: webserver EC2 instance ID
+    Value: !Ref WebInstance
+
+  ApiInstanceId:
+    Description: api EC2 instance ID
+    Value: !Ref ApiInstance
+
+  BffInstanceId:
+    Description: bff EC2 instance ID
+    Value: !Ref BffInstance
+
+  WorkerInstanceId:
+    Description: worker EC2 instance ID
+    Value: !Ref WorkerInstance
+
+  WebSecurityGroupId:
+    Description: webserver SG ID
+    Value: !Ref WebSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-WebSecurityGroupId"
+
+  ApiSecurityGroupId:
+    Description: api SG ID
+    Value: !Ref ApiSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-ApiSecurityGroupId"
+
+  BffSecurityGroupId:
+    Description: bff SG ID
+    Value: !Ref BffSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-BffSecurityGroupId"
+
+  WorkerSecurityGroupId:
+    Description: worker SG ID
+    Value: !Ref WorkerSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-WorkerSecurityGroupId"

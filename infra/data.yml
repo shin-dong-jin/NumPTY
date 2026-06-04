@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NumPTY - Data tier stack (Layer 2 of 3: network / data / app).
+  3 EC2 instances (redis / mongo / mysql) in the PRIVATE subnet, each with
+  its OWN security group (least privilege: each db opens only its own port,
+  from only the precisely allowed sources).
+  SSH and DB port ingress is added by app-stack via cross-stack SecurityGroupIngress rules
+  (because the sources are app-tier SGs that don't exist until app-stack).
+  Actual redis/mongo/mysql install is Ansible's job (not UserData).
+  Imports VpcId / PrivateSubnetId from the network stack and
+  BastionSecurityGroupId from the bastion stack.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: numpty
+    Description: Prefix for naming and for ImportValue lookups.
+
+  MySQLInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: MySQL instance type for data tier nodes.
+
+  MongoInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: MongoDB instance type for data tier nodes.
+
+  RedisInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Redis instance type for data tier nodes.
+
+  MySQLDataVolumeSize:
+    Type: Number
+    Default: 20
+    Description: Size (GiB) of the persistent EBS data volume for MySQL (mounted at /var/lib/mysql by Ansible).
+
+  MongoDataVolumeSize:
+    Type: Number
+    Default: 20
+    Description: Size (GiB) of the persistent EBS data volume for MongoDB (mounted at /var/lib/mongo by Ansible).
+
+  DataKeyName:
+    Type: String
+    Default: numpty-data-key
+    Description: Existing EC2 key pair for the bastion->db SSH hop.
+
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Always-latest Amazon Linux 2023 AMI from the AWS public SSM path.
+
+Resources:
+  # ===== Security Groups (one per db, least privilege) =====
+  # Each SG opens only SSH (22) from bastion here.
+  # SSH port (22) ingress from bastion host SG and the actual db port (3306/27017/6379)
+  # ingress from app SGs is added by app-stack via cross-stack SecurityGroupIngress
+  # - app knows which tier (api/bff/worker) needs which db.
+
+  MysqlSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} mysql SG (ssh: bastion; 3306: added by app-stack)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (package install via NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-mysql-sg"
+
+  MongoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} mongo SG (ssh: bastion; 27017: added by app-stack)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (package install via NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-mongo-sg"
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} redis SG (ssh: bastion; 6379: added by app-stack)"
+      VpcId:
+        Fn::ImportValue: !Sub "${ProjectName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (package install via NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-redis-sg"
+
+  # ===== EC2 instances (each with its own SG) =====
+  MysqlInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref MySQLInstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref DataKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnetId"
+      SecurityGroupIds:
+        - !Ref MysqlSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-mysql"
+        - Key: Role
+          Value: mysql
+
+  MongoInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref MongoInstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref DataKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnetId"
+      SecurityGroupIds:
+        - !Ref MongoSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-mongo"
+        - Key: Role
+          Value: mongo
+
+  RedisInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref RedisInstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref DataKeyName
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnetId"
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-redis"
+        - Key: Role
+          Value: redis
+
+  # ===== Persistent data volumes (mysql + mongo only) =====
+  # Dedicated EBS data volume per stateful db, kept SEPARATE from the root volume.
+  #  - DeletionPolicy: Retain        -> volume survives `delete-stack` (data is NOT lost)
+  #  - UpdateReplacePolicy: Retain   -> volume survives if the instance is replaced on update
+  #  - AvailabilityZone via GetAtt   -> volume lands in the SAME AZ as its instance
+  #                                     (single private subnet => single AZ, no circular dep:
+  #                                      volume depends on instance, instance does not on volume)
+  #  - Device /dev/sdf               -> on Nitro (t3) this surfaces in the OS as /dev/nvme1n1;
+  #                                     Ansible (prepare-storage) formats once (skips if already
+  #                                     formatted, so retained data is preserved) and mounts it
+  #                                     at the db's default datadir BEFORE the db first starts.
+  # NOTE: Redis intentionally has NO volume - it is an ephemeral task-stream buffer and
+  #       MongoDB is the source of truth, so a lost redis node is rebuilt from mongo.
+  MysqlDataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Size: !Ref MySQLDataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      AvailabilityZone: !GetAtt MysqlInstance.AvailabilityZone
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-mysql-data"
+        - Key: Role
+          Value: mysql
+
+  MysqlDataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref MysqlInstance
+      VolumeId: !Ref MysqlDataVolume
+      Device: /dev/sdf
+
+  MongoDataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Size: !Ref MongoDataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      AvailabilityZone: !GetAtt MongoInstance.AvailabilityZone
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-mongo-data"
+        - Key: Role
+          Value: mongo
+
+  MongoDataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref MongoInstance
+      VolumeId: !Ref MongoDataVolume
+      Device: /dev/sdf
+
+Outputs:
+  # ===== Private IPs (for app-stack EnvironmentFile values via Ansible) =====
+  MysqlPrivateIp:
+    Description: MySQL private IP (app connects here, 3306)
+    Value: !GetAtt MysqlInstance.PrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-MysqlPrivateIp"
+
+  MongoPrivateIp:
+    Description: MongoDB private IP (app connects here, 27017)
+    Value: !GetAtt MongoInstance.PrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-MongoPrivateIp"
+
+  RedisPrivateIp:
+    Description: Redis private IP (app connects here, 6379)
+    Value: !GetAtt RedisInstance.PrivateIp
+    Export:
+      Name: !Sub "${ProjectName}-RedisPrivateIp"
+
+  # ===== Instance IDs (for reference) =====
+  MysqlInstanceId:
+    Description: MySQL instance ID
+    Value: !Ref MysqlInstance
+
+  MongoInstanceId:
+    Description: MongoDB instance ID
+    Value: !Ref MongoInstance
+
+  RedisInstanceId:
+    Description: Redis instance ID
+    Value: !Ref RedisInstance
+
+  # ===== Data volume IDs (for reference / manual snapshot / DLM targeting) =====
+  MysqlDataVolumeId:
+    Description: MySQL persistent data volume ID (Retain on stack delete; mounted at /var/lib/mysql)
+    Value: !Ref MysqlDataVolume
+
+  MongoDataVolumeId:
+    Description: MongoDB persistent data volume ID (Retain on stack delete; mounted at /var/lib/mongo)
+    Value: !Ref MongoDataVolume
+
+  # ===== SG IDs (app-stack imports these to add db port ingress) =====
+  MysqlSecurityGroupId:
+    Description: MySQL SG ID (app-stack adds 3306 ingress from api SG)
+    Value: !Ref MysqlSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-MysqlSecurityGroupId"
+
+  MongoSecurityGroupId:
+    Description: MongoDB SG ID (app-stack adds 27017 ingress from api SG)
+    Value: !Ref MongoSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-MongoSecurityGroupId"
+
+  RedisSecurityGroupId:
+    Description: Redis SG ID (app-stack adds 6379 ingress from api/bff/worker SGs)
+    Value: !Ref RedisSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-RedisSecurityGroupId"

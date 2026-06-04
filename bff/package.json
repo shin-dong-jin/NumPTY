@@ -1,0 +1,25 @@
+{
+  "name": "bff",
+  "version": "0.0.0",
+  "description": "NumPTY bff",
+  "license": "ISC",
+  "type": "module",
+  "scripts": {
+    "dev:daemon": "nodemon daemon.js",
+    "dev:app": "nodemon app.js",
+    "start:daemon": "node daemon.js",
+    "start:app": "node app.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.10.0",
+    "node-pty": "^1.1.0",
+    "ulid": "^3.0.2",
+    "uuid": "^13.0.0",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}

@@ -1,0 +1,8 @@
+---
+# app 전용 - api가 db 접속할 때 쓸 인프라 정보
+mysql_private_ip: "192.168.2.125"
+mongo_private_ip: "192.168.2.34"
+redis_private_ip: "192.168.2.15"
+api_private_ip: "192.168.2.248"
+bff_private_ip: "192.168.2.243"
+web_private_ip: "192.168.1.245"

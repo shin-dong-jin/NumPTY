@@ -1,0 +1,89 @@
+---
+- name: Install nginx for web static serving + WebSocket proxy + certbot
+  hosts: web
+  become: yes
+
+  vars:
+    web_root: /opt/numpty/web
+    # certbot이 HTTP-01 challenge 파일을 쓰는 위치.
+    # nginx가 이 디렉터리를 /.well-known/acme-challenge/로 노출.
+    # configure-web에서도 같은 경로를 쓰므로 vars에 묶지 않고
+    # 두 playbook에 동일 값 (변경 시 둘 다 수정).
+    acme_challenge_root: /var/lib/letsencrypt
+
+  tasks:
+    # ===== nginx 설치 =====
+    # AL2023 기본 저장소에 nginx 있음. dnf로 설치.
+    # nginx는 패키지가 'nginx' 사용자를 자동 생성하므로
+    # api/worker/bff처럼 numpty 사용자 따로 안 만듦.
+    - name: Install nginx
+      ansible.builtin.dnf:
+        name: nginx
+        state: present
+
+    # ===== 정적 파일 디렉터리 =====
+    # vite build 결과물(dist/)을 여기로 옮길 것.
+    # nginx 사용자가 읽을 수 있게 소유권/권한.
+    - name: Create web root directory
+      ansible.builtin.file:
+        path: "{{ web_root }}"
+        owner: nginx
+        group: nginx
+        mode: "0755"
+        state: directory
+
+    # ===== nginx 서비스 활성화 (아직 start 안 함) =====
+    # 설정은 configure 단계에서. 여기선 enable만.
+    # 기본 설정으로 start하면 80 포트 점유하니, configure 후 start.
+    - name: Enable nginx service (not started yet)
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: yes
+
+    # ===== 설치 확인 =====
+    - name: Verify nginx version
+      ansible.builtin.command:
+        cmd: nginx -v
+      register: nginx_version
+      changed_when: false
+
+    - name: Show nginx version
+      ansible.builtin.debug:
+        msg: "{{ nginx_version.stderr }}"
+
+    # ========================================================
+    # certbot - Let's Encrypt 인증서 발급/갱신
+    # ========================================================
+    # 발급 전략: webroot 플러그인.
+    # - certbot이 nginx 설정을 자동으로 만지지 않음 (--nginx 플러그인 X)
+    # - nginx는 무중단으로 갱신 가능 (--standalone과 달리 80 점유 안 함)
+    # - 본인 nginx 설정은 본인이 통제 (template이 진실의 원천)
+    #
+    # AL2023에는 dnf로 certbot 패키지 있음 (EPEL 불필요).
+    # python3-certbot-nginx는 안 깜 - --nginx 플러그인 안 쓰니까.
+    - name: Install certbot
+      ansible.builtin.dnf:
+        name: certbot
+        state: present
+
+    # certbot webroot용 디렉토리.
+    # nginx 설정이 /.well-known/acme-challenge/를 여기로 매핑.
+    # certbot이 challenge 파일을 여기 두면 nginx가 인터넷에 응답.
+    - name: Create acme-challenge webroot
+      ansible.builtin.file:
+        path: "{{ acme_challenge_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ===== 설치 확인 =====
+    - name: Verify certbot version
+      ansible.builtin.command:
+        cmd: certbot --version
+      register: certbot_version
+      changed_when: false
+
+    - name: Show certbot version
+      ansible.builtin.debug:
+        msg: "{{ certbot_version.stdout }}"

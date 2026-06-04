@@ -1,0 +1,29 @@
+---
+# Vault alias - 모든 그룹에서 쓰일 수 있는 비밀번호 alias
+mysql_app_password: "{{ vault_mysql_app_password }}"
+mongo_app_password: "{{ vault_mongo_app_password }}"
+redis_password: "{{ vault_redis_password }}"
+jwt_secret: "{{ vault_jwt_secret }}"
+
+# 관리 비밀번호 alias - data에서만 쓰지만 vault 옆에 두는 일관성
+mysql_root_password: "{{ vault_mysql_root_password }}"
+mongo_admin_password: "{{ vault_mongo_admin_password }}"
+
+# 공유 식별자 - data가 만들고 app이 씀
+mysql_app_user: numpty_app
+mysql_app_database: numpty
+mongo_app_user: numpty_app
+mongo_app_database: numpty
+
+# ===== TLS / 도메인 =====
+# numpty.kr 도메인은 가비아에서 구매 + Route 53으로 NS 위임.
+# CFN(infra/app.yml)이 A/CNAME 레코드를 만들고, ansible이 그 도메인으로
+# Let's Encrypt 인증서를 발급한다. 두 시스템(CFN, ansible)이 같은 값을
+#참조해야 하므로 한 곳에서 관리 - all/vars.yml.
+domain_name: numpty.kr
+domain_aliases:
+  - "www.numpty.kr"
+
+# Let's Encrypt 등록 이메일. 인증서 만료 임박 / 갱신 실패 시 알림 받는 곳.
+# 평소 보는 메일이어야 - 자동 갱신 실패 인지 못 하면 90일 뒤 사이트 다운.
+letsencrypt_email: "{{ vault_letsencrypt_email }}"

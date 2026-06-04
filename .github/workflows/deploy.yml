@@ -1,0 +1,532 @@
+# Deploy NumPTY end-to-end.
+#
+# Three sequential jobs (a push to main runs the whole chain):
+#   1. build         - compile/package every component, upload artifacts
+#   2. deploy-infra  - network -> data -> app CFN stacks
+#   3. deploy-app    - ephemeral bastion + ansible + cleanup
+#
+# build gates everything: nothing deploys (infra or app) unless every
+# artifact builds. infra and app are *technically* independent of the
+# build, but a broken build must not mutate live infrastructure - so the
+# chain is strictly sequential, build first.
+#
+# (static-analysis will slot in front of build as another gate once the
+# repo is public - GitHub's free analysis tiers are public-only.)
+#
+# Jobs run on separate runners, so build outputs do NOT carry over -
+# build uploads them as an artifact and deploy-app downloads them back
+# into the same relative paths the ansible playbooks expect.
+#
+# Bastion lifecycle stays inside deploy-app:
+#   create-bastion -> ansible -> delete-bastion (always).
+#   Step-level `if: always()` guarantees cleanup even if ansible fails.
+
+name: Deploy
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+
+# Serialize all numpty deploys at the workflow level. Two pushes
+# back-to-back queue rather than overlap. cancel-in-progress: false so a
+# running deploy is never killed mid-flight (bastion would orphan, SG
+# ingress would dangle).
+concurrency:
+  group: numpty-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  AWS_ACCOUNT_ID: "412712105280"
+  PROJECT_NAME: numpty
+  BASTION_STACK_NAME: numpty-bastion-cfn-stack
+  BASTION_TEMPLATE: infra/bastion.yml
+
+jobs:
+  # ===================================================================
+  # Job 1: Build every component artifact on the runner.
+  # No AWS credentials, no environment - this job only compiles and
+  # packages, then hands the outputs to deploy-app via an artifact.
+  #
+  #   api    -> jar (every build) + deterministic lib.tar.gz (deps only)
+  #   web    -> dist.tar.gz (plain - dist changes every build)
+  #   bff    -> deterministic src.tar.gz (no node_modules; installs on EC2)
+  #   worker -> native binary built inside an amazonlinux:2023 container
+  # ===================================================================
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- web: dist archive ----------
+      - name: Set up Node for web build
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dist
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # dist/ has many small vite chunks - one archive collapses the
+      # per-file transfer. dist changes every build, so no determinism.
+      - name: Archive web dist
+        run: tar -czf web-dist.tar.gz -C web/dist .
+
+      # ---------- bff: deterministic source archive ----------
+      # bff installs on the EC2, so ship source only (no node_modules).
+      # Deterministic so unchanged source -> identical archive ->
+      # configure-bff skips unpack/npm install/setup_os (stays incremental).
+      - name: Archive bff source (deterministic, no node_modules)
+        run: |
+          tar --sort=name --mtime='@0' \
+              --owner=0 --group=0 --numeric-owner \
+              --exclude='./node_modules' \
+              -C bff -cf - . \
+            | gzip -n > bff-src.tar.gz
+
+      # ---------- api: jar + deterministic dependency archive ----------
+      - name: Set up JDK 17 for api build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: api/pom.xml
+
+      - name: Build api jar
+        working-directory: api
+        run: ./mvnw -B package -DskipTests
+
+      # Deterministic tar of the dependency jars: --sort + fixed mtime +
+      # zeroed owner + gzip -n strip every source of byte nondeterminism,
+      # so an unchanged lib/ yields a byte-identical archive across builds.
+      # configure-api then copies one file and only re-ships when deps
+      # actually change (Ansible copy compares the archive checksum).
+      - name: Archive api dependency jars (deterministic)
+        run: |
+          tar --sort=name --mtime='@0' \
+              --owner=0 --group=0 --numeric-owner \
+              -C api/target -cf - lib \
+            | gzip -n > api/target/lib.tar.gz
+
+      # ---------- worker: native build inside AL2023 ----------
+      # worker is a native C binary dynamically linked against AL2023's
+      # glibc/hiredis/gmp, so it must build on AL2023 - not ubuntu. The
+      # build/ output lands on the runner via the volume mount.
+      - name: Build worker in AL2023 container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/worker:/work" -w /work \
+            amazonlinux:2023 \
+            bash -c "dnf install -y gcc make cmake hiredis-devel gmp-devel && cmake -B build && cmake --build build"
+
+      # ---------- Hand outputs to deploy-app ----------
+      # Paths are preserved relative to the workspace, so deploy-app's
+      # download restores them where the ansible `src:` paths expect.
+      # if-no-files-found: error catches a silently-broken build.
+      # (Artifacts don't preserve the exec bit, but configure-worker
+      #  copies the binary with mode 0755, so the worker binary is fine.)
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          if-no-files-found: error
+          path: |
+            web-dist.tar.gz
+            bff-src.tar.gz
+            api/target/api-1.0-SNAPSHOT.jar
+            api/target/lib.tar.gz
+            worker/build/worker
+
+  # ===================================================================
+  # Job 2: Infrastructure (network -> data -> app).
+  # Gated on build. Each `cloudformation deploy` is a no-op when its
+  # template is unchanged, so running all three every time is cheap and
+  # keeps the live infra in sync with main.
+  # ===================================================================
+  deploy-infra:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: infra
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::412712105280:role/NumPTYGitActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CFN network stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name numpty-network-cfn-stack \
+            --template-file infra/network.yml \
+            --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/NumPTYCloudFormationServiceRole" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION"
+
+      - name: Deploy CFN data stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name numpty-data-cfn-stack \
+            --template-file infra/data.yml \
+            --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/NumPTYCloudFormationServiceRole" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION"
+
+      - name: Deploy CFN app stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name numpty-app-cfn-stack \
+            --template-file infra/app.yml \
+            --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/NumPTYCloudFormationServiceRole" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION"
+
+  # ===================================================================
+  # Job 3: App deploy (ephemeral bastion + ansible + cleanup).
+  # Gated on deploy-infra (and transitively build). First downloads the
+  # build artifacts, then runs the bastion/ansible/cleanup flow on one
+  # runner so ssh keys, ssh config, vault file, env vars set early are
+  # visible to every later step.
+  # ===================================================================
+  deploy-app:
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    environment: app
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- Pull build outputs back onto this runner ----------
+      # Restores into the workspace at api/target/..., web-dist.tar.gz,
+      # bff-src.tar.gz, worker/build/worker - the paths ansible expects.
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::412712105280:role/NumPTYGitActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ---------- Create the ephemeral bastion ----------
+      - name: Create bastion stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$BASTION_STACK_NAME" \
+            --template-file "$BASTION_TEMPLATE" \
+            --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/NumPTYCloudFormationServiceRole" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION"
+
+      # ---------- Read all CFN outputs we need ----------
+      # One step grabs everything (bastion + 7 EC2 IPs + 7 SG IDs).
+      # Stashing in $GITHUB_ENV makes the values visible to every later
+      # step without re-querying CloudFormation.
+      - name: Read CFN outputs
+        run: |
+          set -euo pipefail
+
+          read_output() {
+            local stack=$1
+            local key=$2
+            aws cloudformation describe-stacks \
+              --stack-name "$stack" \
+              --region "$AWS_REGION" \
+              --query "Stacks[0].Outputs[?OutputKey=='${key}'].OutputValue" \
+              --output text
+          }
+
+          # bastion
+          BASTION_IP=$(read_output "$BASTION_STACK_NAME" BastionPublicIp)
+          BASTION_SG=$(read_output "$BASTION_STACK_NAME" BastionSecurityGroupId)
+
+          # data tier private IPs
+          MYSQL_IP=$(read_output numpty-data-cfn-stack MysqlPrivateIp)
+          MONGO_IP=$(read_output numpty-data-cfn-stack MongoPrivateIp)
+          REDIS_IP=$(read_output numpty-data-cfn-stack RedisPrivateIp)
+
+          # app tier private IPs
+          API_IP=$(read_output numpty-app-cfn-stack ApiPrivateIp)
+          BFF_IP=$(read_output numpty-app-cfn-stack BffPrivateIp)
+          WORKER_IP=$(read_output numpty-app-cfn-stack WorkerPrivateIp)
+          WEB_IP=$(read_output numpty-app-cfn-stack WebPrivateIp)
+
+          # data tier SG IDs (workflow adds SSH ingress to all 7)
+          MYSQL_SG=$(read_output numpty-data-cfn-stack MysqlSecurityGroupId)
+          MONGO_SG=$(read_output numpty-data-cfn-stack MongoSecurityGroupId)
+          REDIS_SG=$(read_output numpty-data-cfn-stack RedisSecurityGroupId)
+
+          # app tier SG IDs
+          API_SG=$(read_output numpty-app-cfn-stack ApiSecurityGroupId)
+          BFF_SG=$(read_output numpty-app-cfn-stack BffSecurityGroupId)
+          WORKER_SG=$(read_output numpty-app-cfn-stack WorkerSecurityGroupId)
+          WEB_SG=$(read_output numpty-app-cfn-stack WebSecurityGroupId)
+
+          {
+            echo "BASTION_IP=$BASTION_IP"
+            echo "BASTION_SG=$BASTION_SG"
+            echo "MYSQL_IP=$MYSQL_IP"
+            echo "MONGO_IP=$MONGO_IP"
+            echo "REDIS_IP=$REDIS_IP"
+            echo "API_IP=$API_IP"
+            echo "BFF_IP=$BFF_IP"
+            echo "WORKER_IP=$WORKER_IP"
+            echo "WEB_IP=$WEB_IP"
+            echo "MYSQL_SG=$MYSQL_SG"
+            echo "MONGO_SG=$MONGO_SG"
+            echo "REDIS_SG=$REDIS_SG"
+            echo "API_SG=$API_SG"
+            echo "BFF_SG=$BFF_SG"
+            echo "WORKER_SG=$WORKER_SG"
+            echo "WEB_SG=$WEB_SG"
+          } >> "$GITHUB_ENV"
+
+          echo "Bastion: $BASTION_IP ($BASTION_SG)"
+
+      # ---------- Open SGs for this deploy ----------
+      - name: Get runner public IP
+        run: |
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+
+      - name: Open runner -> bastion (port 22)
+        run: |
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$BASTION_SG" \
+            --protocol tcp --port 22 \
+            --cidr "${RUNNER_IP}/32" \
+            --region "$AWS_REGION"
+
+      - name: Open bastion -> 7 targets (port 22)
+        run: |
+          for SG in "$MYSQL_SG" "$MONGO_SG" "$REDIS_SG" \
+                   "$API_SG" "$BFF_SG" "$WORKER_SG" "$WEB_SG"; do
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG" \
+              --protocol tcp --port 22 \
+              --source-group "$BASTION_SG" \
+              --region "$AWS_REGION" || echo "SG $SG: rule may already exist, continuing"
+          done
+
+      # ---------- SSH keys + ssh config + vault password ----------
+      - name: Prepare SSH keys
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.BASTION_PRIVATE_KEY }}" > ~/.ssh/numpty-bastion-key.pem
+          echo "${{ secrets.DATA_PRIVATE_KEY }}"    > ~/.ssh/numpty-data-key.pem
+          echo "${{ secrets.APP_PRIVATE_KEY }}"     > ~/.ssh/numpty-app-key.pem
+          chmod 600 ~/.ssh/*.pem
+
+      - name: Generate ssh config
+        run: |
+          cat > ~/.ssh/config <<EOF_SSH
+          Host numpty-bastion
+              HostName ${BASTION_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-bastion-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+
+          Host numpty-mysql
+              HostName ${MYSQL_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-data-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+              ProxyJump numpty-bastion
+
+          Host numpty-mongo
+              HostName ${MONGO_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-data-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+              ProxyJump numpty-bastion
+
+          Host numpty-redis
+              HostName ${REDIS_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-data-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+              ProxyJump numpty-bastion
+
+          Host numpty-web
+              HostName ${WEB_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-app-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+              ProxyJump numpty-bastion
+
+          Host numpty-bff
+              HostName ${BFF_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-app-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+              ProxyJump numpty-bastion
+
+          Host numpty-api
+              HostName ${API_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-app-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+              ProxyJump numpty-bastion
+
+          Host numpty-worker
+              HostName ${WORKER_IP}
+              User ec2-user
+              IdentityFile ~/.ssh/numpty-app-key.pem
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile /dev/null
+              ProxyJump numpty-bastion
+          EOF_SSH
+          chmod 600 ~/.ssh/config
+
+      - name: Prepare vault password file
+        run: |
+          echo "${{ secrets.VAULT_PASSWORD }}" > ansible/.vault-pass
+          chmod 600 ansible/.vault-pass
+
+      - name: Generate ansible vars from CFN
+        working-directory: ansible
+        run: |
+          cat > group_vars/app/vars.yml <<EOF
+          mysql_private_ip: $MYSQL_IP
+          mongo_private_ip: $MONGO_IP
+          redis_private_ip: $REDIS_IP
+          api_private_ip: $API_IP
+          bff_private_ip: $BFF_IP
+          web_private_ip: $WEB_IP
+          EOF
+
+      - name: Install ansible
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install ansible
+
+      # ---------- Per-component install + configure ----------
+      # Build outputs were downloaded above; these playbooks ship them
+      # to the EC2s (no compilation here).
+      - name: Mysql install + configure
+        working-directory: ansible
+        run: |
+          ansible-playbook playbooks/prepare-mysql.yml
+          ansible-playbook playbooks/install-mysql.yml
+          ansible-playbook playbooks/configure-mysql.yml
+
+      - name: Mongo install + configure
+        working-directory: ansible
+        run: |
+          ansible-playbook playbooks/prepare-mongo.yml
+          ansible-playbook playbooks/install-mongo.yml
+          ansible-playbook playbooks/configure-mongo.yml
+
+      - name: Redis install + configure
+        working-directory: ansible
+        run: |
+          ansible-playbook playbooks/install-redis.yml
+          ansible-playbook playbooks/configure-redis.yml
+
+      - name: Worker install + configure
+        working-directory: ansible
+        run: |
+          ansible-playbook playbooks/install-worker.yml
+          ansible-playbook playbooks/configure-worker.yml
+
+      - name: Api install + configure
+        working-directory: ansible
+        run: |
+          ansible-playbook playbooks/install-api.yml
+          ansible-playbook playbooks/configure-api.yml
+
+      - name: Bff install + configure
+        working-directory: ansible
+        run: |
+          ansible-playbook playbooks/install-bff.yml
+          ansible-playbook playbooks/configure-bff.yml
+
+      - name: Web install + configure
+        working-directory: ansible
+        run: |
+          ansible-playbook playbooks/install-web.yml
+          ansible-playbook playbooks/configure-web.yml
+
+      # ---------- Cleanup (always runs) ----------
+      # Step-level `if: always()`: even if an ansible step fails above,
+      # these still run so SG ingress is revoked and the bastion stack is
+      # destroyed. Deleting the bastion SG is the final safety net - any
+      # dangling references to it vanish automatically.
+
+      - name: Revoke bastion -> 7 targets (port 22)
+        if: always()
+        run: |
+          if [ -z "${BASTION_SG:-}" ]; then
+            echo "BASTION_SG missing; skipping target revoke"
+            exit 0
+          fi
+          for SG in "$MYSQL_SG" "$MONGO_SG" "$REDIS_SG" \
+                   "$API_SG" "$BFF_SG" "$WORKER_SG" "$WEB_SG"; do
+            [ -z "$SG" ] && continue
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$SG" \
+              --protocol tcp --port 22 \
+              --source-group "$BASTION_SG" \
+              --region "$AWS_REGION" || echo "Revoke on $SG failed (already gone?) - continuing"
+          done
+
+      - name: Revoke runner -> bastion (port 22)
+        if: always()
+        run: |
+          if [ -n "${BASTION_SG:-}" ] && [ -n "${RUNNER_IP:-}" ]; then
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$BASTION_SG" \
+              --protocol tcp --port 22 \
+              --cidr "${RUNNER_IP}/32" \
+              --region "$AWS_REGION" || echo "Revoke failed (already removed?) - continuing"
+          else
+            echo "BASTION_SG or RUNNER_IP missing; skipping runner revoke"
+          fi
+
+      - name: Delete bastion stack
+        if: always()
+        run: |
+          aws cloudformation delete-stack \
+            --stack-name "$BASTION_STACK_NAME" \
+            --region "$AWS_REGION"
+
+          aws cloudformation wait stack-delete-complete \
+            --stack-name "$BASTION_STACK_NAME" \
+            --region "$AWS_REGION" \
+            || echo "Delete wait timed out - check the stack manually"

@@ -1,0 +1,89 @@
+#!/bin/zsh
+
+API_BASE="${API_BASE:-http://localhost:8080}"
+
+echo
+echo "Register"
+
+# 이메일 입력 + 검증 (zsh 정규식)
+while true; do
+    read "EMAIL?  Email: "
+    if [[ -z "$EMAIL" ]]; then
+        echo "  - Email cannot be empty."
+        continue
+    fi
+    if [[ ! "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+        echo "  - Invalid email format. Try again."
+        continue
+    fi
+    break
+done
+
+# 이름
+while true; do
+    read "NAME?  Name: "
+    if [[ -z "$NAME" ]]; then
+        echo "  - Name cannot be empty."
+        continue
+    fi
+    break
+done
+
+# 비밀번호
+while true; do
+    read -s "PASSWORD?  Password (min 8 chars): "
+    echo
+
+    if [[ ${#PASSWORD} -lt 8 ]]; then
+        echo "  - Password too short. Try again."
+        continue
+    fi
+
+    read -s "PASSWORD_CONFIRM?  Confirm Password: "
+    echo
+
+    if [[ "$PASSWORD" != "$PASSWORD_CONFIRM" ]]; then
+        echo "  - Passwords do not match. Try again."
+        continue
+    fi
+
+    break
+done
+
+JSON=$(jq -n \
+    --arg email "$EMAIL" \
+    --arg name "$NAME" \
+    --arg password "$PASSWORD" \
+    '{email: $email, name: $name, password: $password}')
+
+echo
+echo "Registering..."
+
+RESPONSE=$(curl -sS -X POST "$API_BASE/api/auth/register" \
+    -H "Content-Type: application/json" \
+    -d "$JSON")
+
+EMAIL_RESULT=$(echo "$RESPONSE" | jq -r '.email // empty')
+ERROR=$(echo "$RESPONSE" | jq -r '.message // .error // empty')
+
+if [[ -n "$EMAIL_RESULT" ]]; then
+    # 성공 — 응답에 email 있으면
+    NAME_RESULT=$(echo "$RESPONSE" | jq -r '.name // empty')
+    echo
+    echo "Registration successful!"
+    echo "  Email: $EMAIL_RESULT"
+    [[ -n "$NAME_RESULT" ]] && echo "  Name:  $NAME_RESULT"
+    echo
+    echo "Next: login"
+elif [[ -n "$ERROR" ]]; then
+    # 에러 메시지 있음
+    echo
+    echo "Registration failed: $ERROR"
+    exit 1
+else
+    # 알 수 없는 응답
+    echo
+    echo "Unexpected response:"
+    echo "$RESPONSE" | jq .
+    exit 1
+fi

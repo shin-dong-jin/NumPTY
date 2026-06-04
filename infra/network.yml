@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NumPTY - Network foundation stack (Layer 1 of 3: network / data / app).
+  VPC + 1 public subnet + 1 private subnet + IGW + NAT instance + route tables
+  + a shared base Security Group. Region: ap-northeast-2.
+  This stack is long-lived and rarely changes. Data/App stacks ImportValue from here.
+  Tier-specific SGs (db ports, app ports) live in their own stacks, NOT here.
+
+  NAT: a t3.micro NAT *instance* (not a managed NAT Gateway). The whole fleet
+  is stopped/started together, and a NAT Gateway cannot be stopped (only
+  create/delete), so it would keep billing ~$42/mo even while everything is
+  off. A NAT instance stops with the fleet -> ~$0 (just its small EBS).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: numpty
+    Description: Prefix for tagging/naming and Export names.
+
+  VpcCidr:
+    Type: String
+    Default: 192.168.0.0/16
+    Description: CIDR block for the VPC.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 192.168.1.0/24
+    Description: CIDR for the public subnet (IGW route).
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 192.168.2.0/24
+    Description: CIDR for the private subnet (NAT route, no inbound from internet).
+
+  NatInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance type for the NAT instance.
+
+  # Resolves to the latest Amazon Linux 2023 AMI at deploy time via the
+  # public SSM parameter - no region-specific AMI ID to hardcode/maintain.
+  NatInstanceAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AL2023 AMI for the NAT instance (auto-resolved from SSM).
+
+Resources:
+  # ---------- VPC ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+
+  # ---------- Internet Gateway ----------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------- Subnets ----------
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet"
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet"
+
+  # ---------- NAT instance (lets private subnet reach the internet outbound) ----------
+  # SG: allow ALL traffic from within the VPC inbound (so private-subnet
+  # instances can route their egress through this box). Egress is the SG
+  # default (allow all) -> the box forwards outward to the internet.
+  NatInstanceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NAT instance - forwards outbound traffic from the VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: !Ref VpcCidr
+          Description: All traffic from within the VPC (to be NAT-ed outbound)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat-sg"
+
+  NatInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      InstanceType: !Ref NatInstanceType
+      ImageId: !Ref NatInstanceAmi
+      SubnetId: !Ref PublicSubnet # NAT itself must sit in a public subnet
+      # CRITICAL: a NAT box relays packets whose dest IP isn't its own.
+      # With source/dest check enabled (default), AWS drops those packets
+      # and NAT silently fails. This MUST be false.
+      SourceDestCheck: false
+      SecurityGroupIds:
+        - !Ref NatInstanceSg
+      # Public IP is auto-assigned (PublicSubnet has MapPublicIpOnLaunch).
+      # Dynamic IP is fine: the route below targets the instance (stable
+      # across stop/start), not its public IP. No EIP -> no idle IP fee
+      # while the fleet is stopped.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          # iptables-services gives a systemd unit that restores saved rules
+          # on every boot - essential because UserData runs only on first
+          # boot, not on each stop/start.
+          dnf install -y iptables-services
+          # Enable IP forwarding (persisted via sysctl.d -> survives reboots).
+          echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-nat.conf
+          sysctl --system
+          # MASQUERADE outbound on the primary interface.
+          IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+          iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+          # Save rules + enable the restore service so stop/start re-applies them.
+          iptables-save > /etc/sysconfig/iptables
+          systemctl enable --now iptables
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat-instance"
+
+  # ---------- Public route table (0.0.0.0/0 -> IGW) ----------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-rt"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------- Private route table (0.0.0.0/0 -> NAT instance) ----------
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-rt"
+
+  # Target the instance (its primary ENI). Stable across stop/start - the
+  # instance keeps the same ENI, only the dynamic public IP changes, which
+  # routing doesn't care about.
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NatInstance
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub "${ProjectName}-VpcId"
+
+  VpcCidr:
+    Description: VPC CIDR (handy for SG rules in other stacks)
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub "${ProjectName}-VpcCidr"
+
+  PublicSubnetId:
+    Description: Public subnet ID (app tier - internet-facing components)
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub "${ProjectName}-PublicSubnetId"
+
+  PrivateSubnetId:
+    Description: Private subnet ID (data tier - no inbound from internet)
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub "${ProjectName}-PrivateSubnetId"
+
+  NatInstanceId:
+    Description: NAT instance ID (stop/start this with the fleet)
+    Value: !Ref NatInstance
+    Export:
+      Name: !Sub "${ProjectName}-NatInstanceId"

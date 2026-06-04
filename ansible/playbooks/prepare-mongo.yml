@@ -1,0 +1,29 @@
+---
+- name: Prepare persistent EBS data volume for MongoDB
+  hosts: mongo
+  become: yes
+
+  vars:
+    mongo_data_device: /dev/nvme1n1 # CFN은 /dev/sdf 로 붙이지만 Nitro(t3)에선 nvme1n1
+    mongo_data_mount: /var/lib/mongo # mongodb-org RPM 기본 dbPath (RHEL 계열!)
+
+  tasks:
+    - name: Create filesystem (xfs; 이미 포맷돼 있으면 건너뜀 -> retained 데이터 보존)
+      community.general.filesystem:
+        fstype: xfs
+        dev: "{{ mongo_data_device }}"
+        force: no
+
+    - name: Ensure mount point exists
+      ansible.builtin.file:
+        path: "{{ mongo_data_mount }}"
+        state: directory
+        mode: "0755"
+
+    - name: Mount + /etc/fstab 등록
+      ansible.posix.mount:
+        path: "{{ mongo_data_mount }}"
+        src: "{{ mongo_data_device }}"
+        fstype: xfs
+        opts: defaults,nofail
+        state: mounted

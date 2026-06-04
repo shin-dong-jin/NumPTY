@@ -1,0 +1,32 @@
+---
+- name: Configure Redis authentication and bind address
+  hosts: redis
+  become: yes
+
+  tasks:
+    - name: Set bind address to all interfaces
+      ansible.builtin.lineinfile:
+        path: /etc/redis6/redis6.conf
+        regexp: "^bind "
+        line: "bind 0.0.0.0 -::1"
+        backup: yes
+      notify: Restart redis
+
+    - name: Set requirepass with vault password
+      ansible.builtin.lineinfile:
+        path: /etc/redis6/redis6.conf
+        regexp: '^#?\s*requirepass '
+        line: "requirepass {{ redis_password }}"
+        backup: yes
+      notify: Restart redis
+
+    - name: Ensure redis6 service is enabled
+      ansible.builtin.systemd:
+        name: redis6
+        enabled: yes
+
+  handlers:
+    - name: Restart redis
+      ansible.builtin.systemd:
+        name: redis6
+        state: restarted

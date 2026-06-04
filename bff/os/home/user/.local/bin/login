@@ -1,0 +1,57 @@
+#!/bin/zsh
+
+API_BASE="${API_BASE:-http://localhost:8080}"
+
+echo
+echo "Login"
+
+while true; do
+    read "EMAIL?  Email: "
+    if [[ -z "$EMAIL" ]]; then
+        echo "  - Email cannot be empty."
+        continue
+    fi
+    break
+done
+
+while true; do
+    read -s "PASSWORD?  Password: "
+    echo
+    if [[ -z "$PASSWORD" ]]; then
+        echo "  - Password cannot be empty."
+        continue
+    fi
+    break
+done
+
+JSON=$(jq -n --arg email "$EMAIL" --arg password "$PASSWORD" \
+    '{email: $email, password: $password}')
+
+echo
+echo "Logging in..."
+
+RESPONSE=$(curl -sS -X POST "$API_BASE/api/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "$JSON")
+
+TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+
+if [[ -z "$TOKEN" ]]; then
+    ERROR=$(echo "$RESPONSE" | jq -r '.message // .error // empty')
+    if [[ -n "$ERROR" ]]; then
+        echo "Login failed: $ERROR"
+    else
+        echo "Login failed"
+        echo "$RESPONSE" | jq .
+    fi
+    return 1
+fi
+
+# OSC for browser
+printf '\e]9999;{"type":"token","token":"%s"}\a' "$TOKEN"
+export NUMPTY_TOKEN="$TOKEN"
+
+EMAIL_RESULT=$(echo "$RESPONSE" | jq -r '.email // empty')
+echo
+echo "Login successful!"
+[[ -n "$EMAIL_RESULT" ]] && echo "  Welcome, $EMAIL_RESULT"

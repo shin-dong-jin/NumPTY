@@ -1,0 +1,103 @@
+---
+- name: Install Temurin JDK 17 and prepare api runtime
+  hosts: api
+  become: yes
+
+  vars:
+    jdk_version: "17.0.18_8"
+    jdk_url: "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.18%2B8/OpenJDK17U-jdk_x64_linux_hotspot_17.0.18_8.tar.gz"
+    jdk_install_dir: "/opt/jdk-17.0.18+8"
+    jdk_symlink: "/opt/jdk-17"
+    api_user: numpty
+    api_group: numpty
+    api_home: /opt/numpty
+
+  tasks:
+    # ===== 전용 사용자 생성 =====
+    # api를 root가 아닌 별도 사용자로 띄우기 위한 격리.
+    # /opt/numpty를 home으로 두되 로그인 셸은 비활성(/sbin/nologin).
+    # 서비스 사용자라 ssh 접근 불필요.
+    - name: Create api service group
+      ansible.builtin.group:
+        name: "{{ api_group }}"
+        state: present
+        system: yes
+
+    - name: Create api service user
+      ansible.builtin.user:
+        name: "{{ api_user }}"
+        group: "{{ api_group }}"
+        home: "{{ api_home }}"
+        shell: /sbin/nologin
+        system: yes
+        state: present
+
+    - name: Create api home directory
+      ansible.builtin.file:
+        path: "{{ api_home }}"
+        owner: "{{ api_user }}"
+        group: "{{ api_group }}"
+        mode: "0755"
+        state: directory
+
+    # ===== JDK 다운로드 + 설치 =====
+    # /opt 아래에 압축 풀고, /opt/jdk-17 심볼릭 링크로 버전 추상화.
+    # 향후 17.0.19 같은 마이너 업그레이드 시 압축만 새로 풀고 심볼릭만 갱신.
+    - name: Check if JDK is already installed (idempotency)
+      ansible.builtin.stat:
+        path: "{{ jdk_install_dir }}/bin/java"
+      register: jdk_check
+
+    - name: Download Temurin JDK 17 tarball
+      ansible.builtin.get_url:
+        url: "{{ jdk_url }}"
+        dest: "/tmp/temurin-17.tar.gz"
+        mode: "0644"
+        timeout: 60
+      register: jdk_download
+      until: jdk_download is succeeded
+      retries: 3
+      delay: 10
+      when: not jdk_check.stat.exists
+
+    - name: Extract JDK to /opt
+      ansible.builtin.unarchive:
+        src: "/tmp/temurin-17.tar.gz"
+        dest: "/opt/"
+        remote_src: yes
+        creates: "{{ jdk_install_dir }}"
+      when: not jdk_check.stat.exists
+
+    - name: Clean up JDK tarball
+      ansible.builtin.file:
+        path: "/tmp/temurin-17.tar.gz"
+        state: absent
+
+    - name: Create version-agnostic JDK symlink
+      ansible.builtin.file:
+        src: "{{ jdk_install_dir }}"
+        dest: "{{ jdk_symlink }}"
+        state: link
+
+    # ===== java 명령을 PATH에 등록 =====
+    # /etc/profile.d/ 아래 스크립트로 모든 사용자 셸 PATH에 java 추가.
+    # alternatives 시스템 안 씀 — Temurin은 dnf 관리 밖이라 alternatives에
+    # 등록하면 dnf가 깐 다른 자바와 충돌 가능. profile 방식이 단순.
+    - name: Set JAVA_HOME and PATH for all users
+      ansible.builtin.copy:
+        dest: /etc/profile.d/jdk.sh
+        content: |
+          export JAVA_HOME={{ jdk_symlink }}
+          export PATH=$JAVA_HOME/bin:$PATH
+        mode: "0644"
+
+    # ===== 설치 확인 =====
+    - name: Verify java -version
+      ansible.builtin.command:
+        cmd: "{{ jdk_symlink }}/bin/java -version"
+      register: java_version_output
+      changed_when: false
+
+    - name: Show java version
+      ansible.builtin.debug:
+        msg: "{{ java_version_output.stderr_lines }}"

@@ -1,0 +1,43 @@
+#!/bin/zsh
+
+CYAN='\033[1;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+GRAY='\033[0;90m'
+RESET='\033[0m'
+
+INDENT="  "
+
+echo ''
+echo -e "${INDENT}${CYAN}NumericalPTY${RESET} - Available commands"
+echo -e "${INDENT}-------------------------------------------------------------"
+echo -e "${INDENT}${YELLOW}Account${RESET}"
+echo -e "${INDENT}  ${GREEN}register${RESET}                       Create a new account"
+echo -e "${INDENT}  ${GREEN}login${RESET}                          Sign in to your account"
+echo ''
+
+echo -e "${INDENT}${YELLOW}Math${RESET}"
+echo -e "${INDENT}  ${GREEN}gcd${RESET} <a> <b>                    Greatest common divisor"
+echo -e "${INDENT}  ${GREEN}lcm${RESET} <a> <b>                    Least common multiple"
+echo -e "${INDENT}  ${GREEN}extended-euclidean${RESET} <a> <b>     ax + by = gcd(a, b)"
+echo -e "${INDENT}  ${GREEN}primality-test${RESET} <n>             Test if n is prime"
+echo -e "${INDENT}  ${GREEN}factorize${RESET} <n>                  Factorize into prime factors"
+echo ''
+
+echo -e "${INDENT}${YELLOW}Theme${RESET}"
+echo -e "${INDENT}  ${GREEN}theme${RESET} <retro|amber|modern>     Switch terminal theme"
+echo ''
+
+echo -e "${INDENT}${YELLOW}General${RESET}"
+echo -e "${INDENT}  ${GREEN}help${RESET}                           Show this message"
+echo -e "${INDENT}  ${GREEN}about${RESET}                          About this project"
+echo -e "${INDENT}  ${GREEN}clear${RESET}                          Clear the screen"
+echo -e "${INDENT}  ${GREEN}exit${RESET}                           Exit terminal"
+echo ''
+echo -e "${INDENT}${YELLOW}Examples:${RESET}"
+echo -e "${INDENT}  ${GREEN}gcd${RESET} 100 75                     -> 25"
+echo -e "${INDENT}  ${GREEN}lcm${RESET} 4 6                        -> 12"
+echo -e "${INDENT}  ${GREEN}primality-test${RESET} 17              -> true"
+echo -e "${INDENT}  ${GREEN}factorize${RESET} 60                   -> 2 * 2 * 3 * 5"
+echo -e "${INDENT}-------------------------------------------------------------"
+echo ''

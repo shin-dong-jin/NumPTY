@@ -1,0 +1,30 @@
+#!/bin/zsh
+
+CYAN='\033[1;36m'
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+GRAY='\033[0;90m'
+RESET='\033[0m'
+
+clear
+
+INDENT="  "
+
+echo
+echo '  ███╗   ██╗██╗   ██╗███╗   ███╗██████╗ ████████╗██╗   ██╗'
+echo '  ████╗  ██║██║   ██║████╗ ████║██╔══██╗╚══██╔══╝╚██╗ ██╔╝'
+echo '  ██╔██╗ ██║██║   ██║██╔████╔██║██████╔╝   ██║    ╚████╔╝ '
+echo '  ██║╚██╗██║██║   ██║██║╚██╔╝██║██╔═══╝    ██║     ╚██╔╝  '
+echo '  ██║ ╚████║╚██████╔╝██║ ╚═╝ ██║██║        ██║      ██║   '
+echo '  ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚═╝        ╚═╝      ╚═╝   '
+echo
+
+echo -e "${INDENT}${CYAN}NumericalPTY${RESET}"
+echo -e "${INDENT}A number theory calculator with terminal interface"
+echo -e "${INDENT}${GRAY}--------------------------------------------------------${RESET}"
+echo -e "${INDENT}Type ${GREEN}help${RESET}     for available commands"
+echo -e "${INDENT}Type ${GREEN}about${RESET}    for project information"
+echo -e "${INDENT}Type ${GREEN}register${RESET} to create an account"
+echo -e "${INDENT}Type ${GREEN}login${RESET}    to sign in"
+echo -e "${INDENT}${GRAY}--------------------------------------------------------${RESET}"
+echo

@@ -1,0 +1,99 @@
+---
+- name: Configure MongoDB authentication and bind address
+  hosts: mongo
+  become: yes
+
+  tasks:
+    # ===== 사전 준비 =====
+    - name: Install python3-pip
+      ansible.builtin.dnf:
+        name: python3-pip
+        state: present
+
+    - name: Install pymongo via pip
+      ansible.builtin.pip:
+        name: pymongo
+        state: latest
+
+    # ===== mongo의 현재 인증 상태 확인 =====
+    # 권한 필요한 명령(getUsers)을 인증 없이 시도.
+    # - 새 mongo (인증 비활성): 성공 (rc=0)
+    # - 이미 셋업된 mongo (인증 활성): 실패 (rc != 0)
+    - name: Check if MongoDB requires authentication
+      ansible.builtin.command:
+        cmd: mongosh --quiet --eval "db.getSiblingDB('admin').getUsers()" --host 127.0.0.1
+      register: mongo_auth_check
+      changed_when: false
+      failed_when: false
+
+    # ===== 분기 1: 새 mongo (인증 비활성, getUsers 성공) =====
+    - name: Create admin user without auth (fresh mongo)
+      community.mongodb.mongodb_user:
+        login_host: 127.0.0.1
+        login_port: 27017
+        database: admin
+        name: "{{ mongo_admin_user }}"
+        password: "{{ mongo_admin_password }}"
+        roles:
+          - { db: "admin", role: "root" }
+        state: present
+      when: mongo_auth_check.rc == 0
+
+    # ===== 분기 2: 이미 셋업된 mongo (인증 활성, getUsers 거부됨) =====
+    - name: Ensure admin user with auth (existing mongo)
+      community.mongodb.mongodb_user:
+        login_host: 127.0.0.1
+        login_port: 27017
+        login_user: "{{ mongo_admin_user }}"
+        login_password: "{{ mongo_admin_password }}"
+        login_database: admin
+        database: admin
+        name: "{{ mongo_admin_user }}"
+        password: "{{ mongo_admin_password }}"
+        roles:
+          - { db: "admin", role: "root" }
+        state: present
+      when: mongo_auth_check.rc != 0
+
+    # ===== 설정 파일 수정: bind + auth =====
+    - name: Set bindIp to 0.0.0.0 in mongod.conf
+      ansible.builtin.lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^\s*bindIp:'
+        line: "  bindIp: 0.0.0.0"
+        backup: yes
+      notify: Restart mongod
+
+    - name: Enable authorization in mongod.conf
+      ansible.builtin.blockinfile:
+        path: /etc/mongod.conf
+        marker: "# {mark} ANSIBLE MANAGED - security"
+        block: |
+          security:
+            authorization: enabled
+        backup: yes
+      notify: Restart mongod
+
+    - name: Flush handlers to restart mongod before app user creation
+      ansible.builtin.meta: flush_handlers
+
+    # ===== 인증 활성화 후: app 사용자 만들기 =====
+    - name: Create MongoDB app user
+      community.mongodb.mongodb_user:
+        login_host: 127.0.0.1
+        login_port: 27017
+        login_user: "{{ mongo_admin_user }}"
+        login_password: "{{ mongo_admin_password }}"
+        login_database: admin
+        database: "{{ mongo_app_database }}"
+        name: "{{ mongo_app_user }}"
+        password: "{{ mongo_app_password }}"
+        roles:
+          - { db: "{{ mongo_app_database }}", role: "readWrite" }
+        state: present
+
+  handlers:
+    - name: Restart mongod
+      ansible.builtin.systemd:
+        name: mongod
+        state: restarted

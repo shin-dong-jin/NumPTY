@@ -1,0 +1,25 @@
+---
+- name: Install and start MongoDB 8.0 Community on numpty data tier
+  hosts: mongo
+  become: yes
+
+  tasks:
+    - name: Add MongoDB 8.0 yum repository
+      ansible.builtin.yum_repository:
+        name: mongodb-org-8.0
+        description: MongoDB Repository
+        baseurl: https://repo.mongodb.org/yum/amazon/2023/mongodb-org/8.0/x86_64/
+        gpgcheck: yes
+        enabled: yes
+        gpgkey: https://pgp.mongodb.com/server-8.0.asc
+
+    - name: Install mongodb-org package
+      ansible.builtin.dnf:
+        name: mongodb-org
+        state: present
+
+    - name: Ensure mongod service is enabled and started
+      ansible.builtin.systemd:
+        name: mongod
+        enabled: yes
+        state: started

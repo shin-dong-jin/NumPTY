@@ -1,0 +1,97 @@
+---
+- name: Configure MySQL authentication, database, and bind address
+  hosts: mysql
+  become: yes
+
+  tasks:
+    # ===== 사전 준비 =====
+    - name: Install python3-pip
+      ansible.builtin.dnf:
+        name: python3-pip
+        state: present
+
+    - name: Install PyMySQL via pip
+      ansible.builtin.pip:
+        name: PyMySQL
+        state: latest
+
+    # ===== 상태 확인: vault root 비번으로 접속되는가 =====
+    # 성공 = 시나리오 B (이미 셋업됨), 실패 = 시나리오 A (새 mysql)
+    - name: Check if mysql root password is already set to vault value
+      ansible.builtin.command:
+        cmd: mysql -u {{ mysql_root_user }} -p{{ mysql_root_password }} -e "SELECT 1;"
+      register: mysql_root_check
+      changed_when: false
+      failed_when: false
+      no_log: true # 비번이 로그에 안 보이게
+
+    # ===== 분기 1: 시나리오 A 처리 (새 mysql) =====
+    # 임시 비번 추출 → root 비번을 vault 값으로 변경
+    - name: Extract temporary root password from mysqld log (fresh mysql)
+      ansible.builtin.shell: |
+        grep 'temporary password' /var/log/mysqld.log | \
+        sed -E 's/.*: //' | tail -n 1
+      register: mysql_temp_password
+      changed_when: false
+      when: mysql_root_check.rc != 0
+
+    - name: Set root password to vault value using temporary password (fresh mysql)
+      ansible.builtin.command:
+        cmd: >
+          mysql -u {{ mysql_root_user }} -p{{ mysql_temp_password.stdout }}
+          --connect-expired-password
+          -e "ALTER USER '{{ mysql_root_user }}'@'localhost' IDENTIFIED BY '{{ mysql_root_password }}';"
+      when: mysql_root_check.rc != 0
+      no_log: true
+
+    # ===== 양쪽 공통: /root/.my.cnf 생성 =====
+    # 이후 mysql 명령들이 자동으로 root 인증되게.
+    - name: Create /root/.my.cnf for auto-auth
+      ansible.builtin.copy:
+        dest: /root/.my.cnf
+        content: |
+          [client]
+          user={{ mysql_root_user }}
+          password={{ mysql_root_password }}
+        owner: "{{ mysql_root_user }}"
+        group: "{{ mysql_root_user }}"
+        mode: "0600"
+      no_log: true
+
+    # ===== 데이터베이스 생성 =====
+    - name: Create app database
+      ansible.mysql.mysql_db:
+        name: "{{ mysql_app_database }}"
+        state: present
+        login_unix_socket: /var/lib/mysql/mysql.sock
+
+    # ===== app 사용자 생성 + 권한 부여 =====
+    # mongo의 numpty_app@numpty와 같은 발상.
+    # 권한은 app 데이터베이스에만 (최소 권한 원칙).
+    - name: Create app user with privileges on app database
+      ansible.mysql.mysql_user:
+        name: "{{ mysql_app_user }}"
+        password: "{{ mysql_app_password }}"
+        host: "%" # 어느 호스트에서 오든 허용 (VPC 안에서만 닿으니 SG가 1차 방어)
+        priv: "{{ mysql_app_database }}.*:ALL"
+        state: present
+        login_unix_socket: /var/lib/mysql/mysql.sock
+
+    # ===== bind-address 변경 =====
+    # 기본 127.0.0.1 → 0.0.0.0 (모든 인터페이스에서 받기)
+    # AL2023의 mysql 패키지는 /etc/my.cnf에 bind-address가 없을 수도,
+    # 있을 수도 있음. lineinfile이 둘 다 처리.
+    - name: Set bind-address to 0.0.0.0 in my.cnf
+      ansible.builtin.lineinfile:
+        path: /etc/my.cnf
+        regexp: '^\s*bind-address\s*='
+        line: "bind-address=0.0.0.0"
+        insertafter: '^\[mysqld\]'
+        backup: yes
+      notify: Restart mysqld
+
+  handlers:
+    - name: Restart mysqld
+      ansible.builtin.systemd:
+        name: mysqld
+        state: restarted

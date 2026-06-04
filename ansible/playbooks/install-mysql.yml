@@ -1,0 +1,26 @@
+---
+- name: Install and start MySQL 8.0 Community on numpty data tier
+  hosts: mysql
+  become: yes
+
+  tasks:
+    - name: Add MySQL 8.0 Community yum repository
+      ansible.builtin.yum_repository:
+        name: mysql80-community
+        description: MySQL 8.0 Community Server
+        baseurl: https://repo.mysql.com/yum/mysql-8.0-community/el/9/$basearch/
+        gpgcheck: yes
+        enabled: yes
+        gpgkey: https://repo.mysql.com/RPM-GPG-KEY-mysql-2023
+
+    - name: Install mysql-community-server package
+      ansible.builtin.dnf:
+        name: mysql-community-server
+        state: present
+        disable_gpg_check: no
+
+    - name: Ensure mysqld service is enabled and started
+      ansible.builtin.systemd:
+        name: mysqld
+        enabled: yes
+        state: started

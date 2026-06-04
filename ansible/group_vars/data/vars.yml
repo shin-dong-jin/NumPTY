@@ -1,0 +1,5 @@
+---
+# data 전용 - db 서버 관리·설정에만 쓰임
+mysql_root_user: root
+mongo_admin_user: admin
+db_bind_address: "0.0.0.0"

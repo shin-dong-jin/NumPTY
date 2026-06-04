@@ -1,0 +1,58 @@
+add_newline=false
+
+format="[NumPTY](bold cyan) $directory $character"
+
+[directory]
+truncation_length=1
+fish_style_pwd_dir_length=0
+format="$path"
+
+[character]
+success_symbol="[❯](green)"
+error_symbol="[❯](red)"
+
+# 1. 클라우드 인프라
+[aws]
+disabled = true
+[gcloud]
+disabled = true
+[azure]
+disabled = true
+[kubernetes]
+disabled = true
+
+# 2. 버전 관리 시스템
+[git_branch]
+disabled = true
+[git_commit]
+disabled = true
+[git_state]
+disabled = true
+[git_status]
+disabled = true
+[git_metrics]
+disabled = true
+
+# 3. 패키지 매니저
+[package]
+disabled = true
+
+# 4. 언어 및 런타임
+[nodejs]
+disabled = true
+[python]
+disabled = true
+[c]
+disabled = true
+[rust]
+disabled = true
+[java]
+disabled = true
+[golang]
+disabled = true
+
+# 5. 기타 무거운 시스템 체크
+[battery]
+disabled = true
+[cmd_duration]
+disabled = true

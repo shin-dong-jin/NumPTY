@@ -1,0 +1,49 @@
+---
+- name: Prepare worker runtime (service user + runtime libraries)
+  hosts: worker
+  become: yes
+
+  vars:
+    api_user: numpty
+    api_group: numpty
+    worker_home: /opt/numpty/worker
+
+  tasks:
+    # ===== 런타임 공유 라이브러리만 =====
+    # 빌드는 CI의 AL2023 컨테이너에서 끝나므로 gcc/make/cmake/-devel 전부 불필요.
+    # worker 바이너리가 동적 링크하는 hiredis/gmp의 런타임 .so만 있으면 됨.
+    # (-devel은 헤더용 빌드 패키지, 이건 실행용 런타임 패키지 — 다른 것.)
+    # 컨테이너도 EC2도 같은 AL2023 저장소에서 받으므로 soname 호환.
+    - name: Install worker runtime libraries (hiredis, gmp)
+      ansible.builtin.dnf:
+        name:
+          - hiredis
+          - gmp
+        state: present
+
+    # ===== numpty 사용자 + 그룹 =====
+    # api/bff와 같은 사용자/그룹으로 시스템 일관성 유지.
+    - name: Create numpty service group
+      ansible.builtin.group:
+        name: "{{ api_group }}"
+        state: present
+        system: yes
+
+    - name: Create numpty service user
+      ansible.builtin.user:
+        name: "{{ api_user }}"
+        group: "{{ api_group }}"
+        home: /opt/numpty
+        shell: /sbin/nologin
+        system: yes
+        state: present
+
+    # ===== 디렉터리 준비 =====
+    # 바이너리(build/worker)와 런타임 자산(resource/)은 configure 단계에서 배치.
+    - name: Create worker home directory
+      ansible.builtin.file:
+        path: "{{ worker_home }}"
+        owner: "{{ api_user }}"
+        group: "{{ api_group }}"
+        mode: "0755"
+        state: directory

@@ -1,0 +1,16 @@
+---
+- name: Install and start Redis on numpty data tier
+  hosts: redis
+  become: yes
+
+  tasks:
+    - name: Install redis6 package
+      ansible.builtin.dnf:
+        name: redis6
+        state: present
+
+    - name: Ensure redis service is enabled and started
+      ansible.builtin.systemd:
+        name: redis6
+        enabled: yes
+        state: started
